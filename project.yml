@@ -1,0 +1,110 @@
+# XcodeGen spec — regenerate Dicta.xcodeproj with `make gen` (or `xcodegen generate`).
+name: Dicta
+packages:
+  # In-app updates. Pinned exactly: CI reads this version and downloads the matching release's CLI tools for the
+  # appcast, so the framework in the app and the tool that signs its feed cannot drift apart.
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: "2.9.6"
+options:
+  bundleIdPrefix: com.honeyyadav
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"   # fallback for plain Xcode builds; make/CI override with the commit count (CFBundleVersion)
+    # Personal team of the honeyrao@icloud.com Apple ID (O=Honey Yadav). Override with `make build TEAM=XXXXXXXXXX`.
+    DEVELOPMENT_TEAM: K6D58UX7NG
+    CODE_SIGN_STYLE: Automatic
+    CODE_SIGN_IDENTITY: "Apple Development"
+    ENABLE_HARDENED_RUNTIME: YES
+    DEAD_CODE_STRIPPING: YES
+    # Apple Silicon only (macOS 26 target, no Intel support) — halves the binary.
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+  configs:
+    Release:
+      # Strip symbols on plain `xcodebuild build` too (normally only Archive does) — ~50% smaller.
+      DEPLOYMENT_POSTPROCESSING: YES
+      STRIP_INSTALLED_PRODUCT: YES
+      STRIP_STYLE: all
+      # The team-pinned designated requirement is applied *after* xcodebuild by scripts/pin-designated-requirement.sh
+      # (`make dist`, CI) — its header explains why it cannot be done from here. DICTA_CODESIGN_EXTRA is a hook for
+      # e.g. --timestamp on everything Xcode signs.
+      OTHER_CODE_SIGN_FLAGS: "$(DICTA_CODESIGN_EXTRA)"
+
+targets:
+  Dicta:
+    type: application
+    platform: macOS
+    sources:
+      - path: Dicta
+        excludes:
+          - "Info.plist"
+          - "Dicta.entitlements"
+    dependencies:
+      - package: Sparkle
+    # Info.plist and Dicta.entitlements are generated from the `properties` below on every `make gen`
+    # and are gitignored — edit them here, not the generated files.
+    entitlements:
+      path: Dicta/Dicta.entitlements
+      properties:
+        # Not sandboxed: CGEventTap (global hotkey) and AX text insertion need it off.
+        com.apple.security.app-sandbox: false
+        com.apple.security.device.audio-input: true
+    info:
+      path: Dicta/Info.plist
+      properties:
+        CFBundleName: Dicta
+        CFBundleDisplayName: Dicta
+        CFBundleIconFile: AppIcon   # Dicta/Resources/AppIcon.icns — regenerate with `make icon`
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSUIElement: true          # menu-bar agent, no Dock icon
+        LSMinimumSystemVersion: "26.0"
+        NSPrincipalClass: NSApplication
+        NSMicrophoneUsageDescription: "Dicta records while you hold the dictation key and sends the audio to Sarvam AI for transcription."
+        NSHumanReadableCopyright: "© 2026 Honey Yadav"
+        # Sparkle. The feed is the newest non-prerelease GitHub Release's appcast.xml (stable redirect).
+        # The public EdDSA key pairs with the `dicta` private key in the maintainer's login Keychain
+        # (`generate_keys --account dicta`) and the SPARKLE_PRIVATE_KEY repository secret.
+        SUFeedURL: https://github.com/5xdev/dicta/releases/latest/download/appcast.xml
+        SUPublicEDKey: VsCbQbZJAMD9vuxpYIL8/nUMbrsecQaFU1xrSKePgB8=
+        SUEnableAutomaticChecks: true      # no first-launch "check automatically?" prompt
+        SUScheduledCheckInterval: 86400    # daily (Sparkle's minimum is 3600)
+        SUAutomaticallyUpdate: false       # the user clicks Update; never silently replace the app
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.honeyyadav.dicta
+        PRODUCT_NAME: Dicta
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Dicta/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Dicta/Dicta.entitlements
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: YES
+        SWIFT_EMIT_LOC_STRINGS: YES
+    scheme:
+      testTargets: [DictaTests]
+      environmentVariables:
+        # Silences the system's os_activity chatter in Xcode's console. Side effect: it also disables the
+        # app's own os_log output for Xcode-launched runs, so `make log` only sees `make run` launches.
+        OS_ACTIVITY_MODE: disable
+
+  # Unit tests for the pure parts (WAV/multipart encoding, hotkey mapping, state resolution, …).
+  # Runs inside the app as host so `@testable import Dicta` sees internal types. `make test`.
+  DictaTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: DictaTests
+    dependencies:
+      - target: Dicta
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.honeyyadav.dicta.tests
+        GENERATE_INFOPLIST_FILE: YES
