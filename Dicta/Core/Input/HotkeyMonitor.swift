@@ -52,11 +52,14 @@ enum HotkeyError: LocalizedError {
 }
 
 /// Global press/release detection for a modifier key using a listen-only CGEventTap.
+/// Also reports Escape presses so an in-progress dictation can be cancelled from any app.
 /// Requires Accessibility (or Input Monitoring) trust; otherwise `tapCreate` returns nil.
 final class HotkeyMonitor {
     var hotkey: Hotkey
     var onPress: (() -> Void)?
     var onRelease: (() -> Void)?
+    /// Escape pressed (key repeats ignored). Listen-only, so the key still reaches the frontmost app.
+    var onEscape: (() -> Void)?
 
     private(set) var isRunning = false
     private var tap: CFMachPort?
@@ -69,7 +72,7 @@ final class HotkeyMonitor {
 
     func start() throws {
         guard !isRunning else { return }
-        let mask: CGEventMask = 1 << CGEventType.flagsChanged.rawValue
+        let mask: CGEventMask = (1 << CGEventType.flagsChanged.rawValue) | (1 << CGEventType.keyDown.rawValue)
         let selfPtr = Unmanaged.passUnretained(self).toOpaque()
 
         guard let tap = CGEvent.tapCreate(
@@ -123,6 +126,11 @@ final class HotkeyMonitor {
             let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
             guard keyCode == hotkey.keyCode else { return }
             setDown(event.flags.contains(hotkey.flag))
+        case .keyDown:
+            // Only the key code is inspected; nothing about other keystrokes is read or kept.
+            guard event.getIntegerValueField(.keyboardEventKeycode) == Int64(kVK_Escape),
+                  event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return }
+            onEscape?()
         default:
             break
         }

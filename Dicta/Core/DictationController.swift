@@ -7,6 +7,7 @@ import Foundation
 /// Everything here runs on the main actor; the audio callback just forwards buffers to the engine.
 /// Only one utterance records at a time, but a new one may start while earlier ones are still uploading;
 /// transcripts are inserted in speaking order regardless of which upload finishes first.
+/// Escape cancels everything at once — the recording, every upload, any error — and hides the overlay.
 ///
 /// Settings live in `Preferences`, TCC state in `PermissionsMonitor` — this object only reads them.
 @MainActor
@@ -30,7 +31,7 @@ final class DictationController: ObservableObject {
 
     // MARK: Published state
 
-    /// Derived from `isRecording` / `uploadsInFlight` / `errorMessage` via `refreshState()`.
+    /// Derived from `current` / `uploads` / `errorMessage` via `refreshState()`.
     @Published private(set) var state: State = .idle
     @Published private(set) var level: Float = 0
     @Published private(set) var lastTranscript: String?
@@ -44,13 +45,34 @@ final class DictationController: ObservableObject {
     private let hotkeyMonitor: HotkeyMonitor
     private var cancellables = Set<AnyCancellable>()
 
+    /// Per-utterance recording state. A cancelled session may still be unwinding (e.g. awaiting `engine.begin()`)
+    /// after a new one has started, so each run checks its own flags instead of shared controller state.
+    @MainActor
+    private final class Session {
+        private(set) var stopRequested = false
+        var cancelled = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func requestStop() {
+            stopRequested = true
+            continuation?.resume()
+            continuation = nil
+        }
+
+        func waitForStop() async {
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                if stopRequested { c.resume() } else { continuation = c }
+            }
+        }
+    }
+
     // Session bookkeeping (all main-actor).
-    private var isRecording = false
-    private var uploadsInFlight = 0
+    /// The utterance currently recording, if any.
+    private var current: Session?
+    /// Uploads still running, keyed so each can remove itself when done (or all be cancelled at once).
+    private var uploads: [UUID: Task<Void, Never>] = [:]
     private var errorMessage: String?
     private var errorGeneration = 0
-    private var stopRequested = false
-    private var stopContinuation: CheckedContinuation<Void, Never>?
     /// Completion of the most recently *started* upload; each session awaits its predecessor before inserting,
     /// so overlapping uploads that finish out of order still land in speaking order.
     private var lastCompletion: Task<Void, Never>?
@@ -65,6 +87,7 @@ final class DictationController: ObservableObject {
 
         hotkeyMonitor.onPress = { [weak self] in self?.beginRecording() }
         hotkeyMonitor.onRelease = { [weak self] in self?.endRecording() }
+        hotkeyMonitor.onEscape = { [weak self] in self?.cancel() }
         recorder.onLevel = { [weak self] in self?.level = $0 }
         recorder.onError = { [weak self] error in
             // Capture died mid-utterance (mic went away) — wrap up what we have and tell the user.
@@ -111,11 +134,30 @@ final class DictationController: ObservableObject {
 
     /// Manual trigger (the popover's record button). Toggles recording.
     func toggle() {
-        isRecording ? endRecording() : beginRecording()
+        current != nil ? endRecording() : beginRecording()
+    }
+
+    /// Escape: abandon the recording and every pending upload without inserting anything, and clear any error,
+    /// so the overlay disappears immediately and a fresh recording can start.
+    func cancel() {
+        guard current != nil || !uploads.isEmpty || errorMessage != nil else { return }
+        Log.app.info("Dictation cancelled")
+        if let session = current {
+            session.cancelled = true
+            session.requestStop()
+            recorder.stop()
+            current = nil
+        }
+        uploads.values.forEach { $0.cancel() }    // cancels the URLSession request too
+        uploads.removeAll()
+        lastCompletion = nil
+        errorGeneration += 1                      // disarm any pending error auto-clear
+        errorMessage = nil
+        refreshState()
     }
 
     private func beginRecording() {
-        guard !isRecording else { return }        // uploads in flight are fine — we can record the next one
+        guard current == nil else { return }      // uploads in flight are fine — we can record the next one
         guard permissions.micAuthorized else {
             fail(message: "Microphone access is required. Enable it in System Settings → Privacy & Security → Microphone.")
             return
@@ -124,20 +166,17 @@ final class DictationController: ObservableObject {
             fail(SarvamError.missingAPIKey)
             return
         }
-        stopRequested = false
-        isRecording = true
+        let session = Session()
+        current = session
         refreshState()
-        Task { await runSession() }
+        Task { await runSession(session) }
     }
 
     private func endRecording() {
-        guard isRecording else { return }
-        stopRequested = true
-        stopContinuation?.resume()
-        stopContinuation = nil
+        current?.requestStop()
     }
 
-    private func runSession() async {
+    private func runSession(_ session: Session) async {
         // One engine instance per utterance, so a new recording can start while this one is still uploading.
         let engine = makeEngine(preferences)
 
@@ -145,14 +184,16 @@ final class DictationController: ObservableObject {
         let startedAt: Date
         do {
             let format = try await engine.begin()
-            if stopRequested {             // released before the engine was ready — treat as a tap
-                finishRecordingPhase()
+            if session.cancelled { return }        // cancel() already reset everything
+            if session.stopRequested {             // released before the engine was ready — treat as a tap
+                finishRecordingPhase(session)
                 return
             }
             startedAt = Date()
             try recorder.start(targetFormat: format) { buffer in engine.feed(buffer) }
         } catch {
-            finishRecordingPhase()
+            if session.cancelled { return }
+            finishRecordingPhase(session)
             fail(error)
             return
         }
@@ -160,35 +201,34 @@ final class DictationController: ObservableObject {
         // The backend is built for short clips: if the key is still held at its limit,
         // stop on the user's behalf and transcribe what we have rather than growing the buffer forever.
         let maxSeconds = engine.maxUtteranceSeconds
-        let limit = Task { [weak self] in
+        let limit = Task {
             try? await Task.sleep(for: .seconds(maxSeconds))
             guard !Task.isCancelled else { return }
             Log.speech.warning("Utterance hit the \(maxSeconds, privacy: .public)s limit — stopping automatically")
-            self?.endRecording()
+            session.requestStop()
         }
 
-        // Suspend until the hotkey is released (or the limit above fires).
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
-            if stopRequested { c.resume() } else { stopContinuation = c }
-        }
+        // Suspend until the hotkey is released, the limit above fires, or Escape cancels.
+        await session.waitForStop()
         limit.cancel()
+        // After a cancel the recorder may already belong to a newer session — leave it alone.
+        if session.cancelled { return }
         recorder.stop()
         let duration = Date().timeIntervalSince(startedAt)
-        finishRecordingPhase()
+        finishRecordingPhase(session)
 
         if duration < 0.25 { return }     // accidental tap — nothing worth transcribing
 
         // ── Upload + insert ─────────────────────────────────────────────────────────────────────
-        uploadsInFlight += 1
-        refreshState()
-
+        let id = UUID()
         let previous = lastCompletion
         let completion = Task { @MainActor [weak self] in
             var text: String?
             var failure: Error?
             do { text = try await engine.finish() } catch { failure = error }
             await previous?.value          // keep insertion in speaking order
-            guard let self else { return }
+            // Cancelled via Escape: drop the result (and the cancellation error) silently.
+            guard let self, !Task.isCancelled else { return }
             if let failure {
                 self.fail(failure)
             } else if let text, !text.isEmpty {
@@ -197,22 +237,25 @@ final class DictationController: ObservableObject {
                 TextInserter.insert(text)
             }
         }
+        uploads[id] = completion
         lastCompletion = completion
+        refreshState()
         await completion.value
 
-        uploadsInFlight -= 1
+        uploads[id] = nil                  // already gone if cancel() ran
         refreshState()
     }
 
-    private func finishRecordingPhase() {
-        isRecording = false
+    private func finishRecordingPhase(_ session: Session) {
+        guard current === session else { return }
+        current = nil
         refreshState()
     }
 
     // MARK: State
 
     private func refreshState() {
-        let new = State.resolve(recording: isRecording, error: errorMessage, uploadsInFlight: uploadsInFlight)
+        let new = State.resolve(recording: current != nil, error: errorMessage, uploadsInFlight: uploads.count)
         if state != new { state = new }
     }
 

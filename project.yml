@@ -16,7 +16,7 @@ options:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.1.1"
     CURRENT_PROJECT_VERSION: "1"   # fallback for plain Xcode builds; make/CI override with the commit count (CFBundleVersion)
     # Personal team of the honeyrao@icloud.com Apple ID (O=Honey Yadav). Override with `make build TEAM=XXXXXXXXXX`.
     DEVELOPMENT_TEAM: K6D58UX7NG
